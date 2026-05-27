@@ -72,7 +72,7 @@ TOOL_DESCRIPTION = (
 
 TOOL_DEFINITION: Dict[str, Any] = {
     "name": TOOL_NAME,
-    "title": "Customer Refund Request Extractor",
+    "title": "Refund Request Extractor",
     "description": TOOL_DESCRIPTION,
     "inputSchema": INPUT_SCHEMA,
     "outputSchema": OUTPUT_SCHEMA,
