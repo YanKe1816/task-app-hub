@@ -6,10 +6,11 @@ from urllib.request import urlopen
 
 import pytest
 
-from server import APP_SLUG, OUTPUT_SCHEMA, TOOL_NAME, app
+from server import APP_SLUG, DELIVERY_APP_SLUG, DELIVERY_OUTPUT_SCHEMA, DELIVERY_TOOL_NAME, OUTPUT_SCHEMA, TOOL_NAME, app
 
 
 EXPECTED_OUTPUT_KEYS = set(OUTPUT_SCHEMA["required"])
+EXPECTED_DELIVERY_OUTPUT_KEYS = set(DELIVERY_OUTPUT_SCHEMA["required"])
 
 
 @pytest.fixture()
@@ -19,10 +20,14 @@ def client():
 
 
 def mcp(client, method, params=None, request_id=1):
+    return mcp_for(client, APP_SLUG, method, params=params, request_id=request_id)
+
+
+def mcp_for(client, slug, method, params=None, request_id=1):
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         payload["params"] = params
-    response = client.post(f"/{APP_SLUG}/mcp", json=payload)
+    response = client.post(f"/{slug}/mcp", json=payload)
     assert response.status_code == 200
     return response.get_json()
 
@@ -31,6 +36,15 @@ def assert_structured_output(value):
     assert set(value.keys()) == EXPECTED_OUTPUT_KEYS
     assert "status" not in value
     assert value["urgency_label"] in {"low", "normal", "high", "unknown"}
+    assert isinstance(value["missing_fields"], list)
+    assert isinstance(value["source_text"], str)
+    assert isinstance(value["errors"], list)
+    for error in value["errors"]:
+        assert set(error.keys()) == {"code", "message"}
+
+
+def assert_delivery_structured_output(value):
+    assert set(value.keys()) == EXPECTED_DELIVERY_OUTPUT_KEYS
     assert isinstance(value["missing_fields"], list)
     assert isinstance(value["source_text"], str)
     assert isinstance(value["errors"], list)
@@ -146,6 +160,36 @@ def test_tools_list_single_tool_contract(client):
         "openWorldHint": False,
         "destructiveHint": False,
     }
+    assert DELIVERY_TOOL_NAME not in [tool["name"] for tool in tools]
+
+
+def test_delivery_initialize_contract(client):
+    data = mcp_for(client, DELIVERY_APP_SLUG, "initialize")
+    result = data["result"]
+    assert result["protocolVersion"] == "2024-11-05"
+    assert result["serverInfo"]["name"] == DELIVERY_APP_SLUG
+    assert result["serverInfo"]["version"] == "0.1.0"
+    assert "tools" in result["capabilities"]
+
+
+def test_delivery_tools_list_single_tool_contract(client):
+    data = mcp_for(client, DELIVERY_APP_SLUG, "tools/list")
+    tools = data["result"]["tools"]
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool["name"] == DELIVERY_TOOL_NAME
+    assert tool["title"] == "Delivery Address Extractor"
+    assert tool["description"]
+    assert "Do not use or present this tool for writing replies" in tool["description"]
+    assert "only extracts structured delivery fields" in tool["description"]
+    assert tool["inputSchema"]["required"] == ["source_text"]
+    assert tool["outputSchema"] == DELIVERY_OUTPUT_SCHEMA
+    assert tool["annotations"] == {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    }
+    assert TOOL_NAME not in [tool["name"] for tool in tools]
 
 
 def test_generic_mcp_absent(client):
@@ -157,6 +201,41 @@ def test_generic_mcp_absent(client):
 def test_generic_review_shell_routes_absent(client, path):
     response = client.get(path)
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path, required_text",
+    [
+        (f"/{DELIVERY_APP_SLUG}", "Extract structured delivery fields from customer-provided delivery messages."),
+        (f"/{DELIVERY_APP_SLUG}/privacy", "No long-term storage of submitted input by this app."),
+        (f"/{DELIVERY_APP_SLUG}/terms", "The app does not contact couriers."),
+        (f"/{DELIVERY_APP_SLUG}/support", "It only extracts explicitly stated delivery fields."),
+    ],
+)
+def test_delivery_review_shell_routes_are_app_specific_html(client, path, required_text):
+    response = client.get(path)
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "text/html" in response.content_type
+    assert "<!doctype html>" in body.lower()
+    assert "Delivery Address Extractor" in body
+    assert "sidcraigau@gmail.com" in body
+    assert required_text in body
+    assert "contact couriers" in body
+    assert "modify orders" in body
+    assert "Customer Refund Request Extractor" not in body
+    assert "Refund Request Extractor" not in body
+    assert "customer_refund_request_extractor" not in body
+    assert "refund approval" not in body.lower()
+    assert "refund rejection" not in body.lower()
+
+
+def test_cross_endpoint_isolation_and_no_generic_mcp(client):
+    refund_tools = mcp_for(client, APP_SLUG, "tools/list")["result"]["tools"]
+    delivery_tools = mcp_for(client, DELIVERY_APP_SLUG, "tools/list")["result"]["tools"]
+    assert [tool["name"] for tool in refund_tools] == [TOOL_NAME]
+    assert [tool["name"] for tool in delivery_tools] == [DELIVERY_TOOL_NAME]
+    assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 404
 
 
 def test_tools_call_complete_refund_message(client):
@@ -325,3 +404,124 @@ def test_missing_fields_are_null_and_listed(client):
     assert structured["customer_request"] == "refund"
     assert structured["missing_fields"] == ["order_id", "product_name", "refund_reason"]
     assert structured["urgency_label"] == "low"
+
+
+def test_delivery_tools_call_complete_message(client):
+    source_text = (
+        'Please extract delivery address fields from this message: "Ship to Emily Carter, '
+        '415-555-0198, 221B Baker Street, Apt 5, San Francisco, CA 94107. '
+        'Leave at the front desk. Deliver tomorrow afternoon."'
+    )
+    result = mcp_for(
+        client,
+        DELIVERY_APP_SLUG,
+        "tools/call",
+        {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]
+    assert "structuredContent" in result
+    assert result["isError"] is False
+    assert result["content"] == [{"type": "text", "text": "success"}]
+    structured = result["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["recipient_name"] == "Emily Carter"
+    assert structured["phone_number"] == "415-555-0198"
+    assert structured["delivery_address"] == "221B Baker Street, Apt 5, San Francisco, CA 94107"
+    assert structured["delivery_note"] == "Leave at the front desk."
+    assert structured["preferred_delivery_time"] == "tomorrow afternoon"
+    assert structured["missing_fields"] == []
+    assert structured["source_text"] == source_text
+    assert structured["errors"] == []
+
+
+def test_delivery_tools_call_labeled_details(client):
+    source_text = (
+        'Extract delivery details: "Name: Mark Lee. Phone: 212-555-0144. '
+        'Address: 88 Pine Street, New York, NY 10005."'
+    )
+    structured = mcp_for(
+        client,
+        DELIVERY_APP_SLUG,
+        "tools/call",
+        {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["recipient_name"] == "Mark Lee"
+    assert structured["phone_number"] == "212-555-0144"
+    assert structured["delivery_address"] == "88 Pine Street, New York, NY 10005"
+    assert structured["delivery_note"] is None
+    assert structured["preferred_delivery_time"] is None
+    assert "delivery_note" in structured["missing_fields"]
+    assert "preferred_delivery_time" in structured["missing_fields"]
+    assert structured["errors"] == []
+
+
+def test_delivery_tools_call_partial_message(client):
+    source_text = 'Extract delivery fields from: "Please send it to 742 Evergreen Terrace. Ring the doorbell twice."'
+    structured = mcp_for(
+        client,
+        DELIVERY_APP_SLUG,
+        "tools/call",
+        {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["recipient_name"] is None
+    assert structured["phone_number"] is None
+    assert structured["delivery_address"] == "742 Evergreen Terrace"
+    assert structured["delivery_note"] == "Ring the doorbell twice."
+    assert structured["preferred_delivery_time"] is None
+    assert "recipient_name" in structured["missing_fields"]
+    assert "phone_number" in structured["missing_fields"]
+    assert "preferred_delivery_time" in structured["missing_fields"]
+    assert structured["errors"] == []
+
+
+def test_delivery_repeated_calls_are_stable(client):
+    params = {
+        "name": DELIVERY_TOOL_NAME,
+        "arguments": {
+            "source_text": 'Extract delivery details: "Name: Mark Lee. Phone: 212-555-0144. Address: 88 Pine Street, New York, NY 10005."'
+        },
+    }
+    first = mcp_for(client, DELIVERY_APP_SLUG, "tools/call", params, request_id=1)["result"]["structuredContent"]
+    second = mcp_for(client, DELIVERY_APP_SLUG, "tools/call", params, request_id=2)["result"]["structuredContent"]
+    third = mcp_for(client, DELIVERY_APP_SLUG, "tools/call", params, request_id=3)["result"]["structuredContent"]
+    assert first == second == third
+
+
+def test_delivery_missing_source_text_error(client):
+    result = mcp_for(client, DELIVERY_APP_SLUG, "tools/call", {"name": DELIVERY_TOOL_NAME, "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": "error"}]
+    structured = result["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["errors"] == [{"code": "missing_field", "message": "source_text is required."}]
+
+
+def test_delivery_empty_source_text_error(client):
+    structured = mcp_for(
+        client,
+        DELIVERY_APP_SLUG,
+        "tools/call",
+        {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": "  "}},
+    )["result"]["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["errors"][0]["code"] == "invalid_value"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Can this address be delivered today?",
+        "Contact the courier and change this delivery address.",
+        "Write a reply to this customer about their delivery.",
+    ],
+)
+def test_delivery_out_of_scope_errors(client, text):
+    structured = mcp_for(
+        client,
+        DELIVERY_APP_SLUG,
+        "tools/call",
+        {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": text}},
+    )["result"]["structuredContent"]
+    assert_delivery_structured_output(structured)
+    assert structured["errors"][0]["code"] == "out_of_scope"

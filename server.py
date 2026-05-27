@@ -7,6 +7,8 @@ from flask import Flask, jsonify, request, send_file
 
 APP_SLUG = "customer-refund-request-extractor"
 TOOL_NAME = "customer_refund_request_extractor"
+DELIVERY_APP_SLUG = "delivery-address-extractor"
+DELIVERY_TOOL_NAME = "delivery_address_extractor"
 
 app = Flask(__name__)
 
@@ -83,6 +85,81 @@ TOOL_DEFINITION: Dict[str, Any] = {
     },
 }
 
+DELIVERY_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_text": {
+            "type": "string",
+            "description": "Raw customer delivery message provided by the user.",
+        }
+    },
+    "required": ["source_text"],
+    "additionalProperties": False,
+}
+
+DELIVERY_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recipient_name": {"type": ["string", "null"]},
+        "phone_number": {"type": ["string", "null"]},
+        "delivery_address": {"type": ["string", "null"]},
+        "delivery_note": {"type": ["string", "null"]},
+        "preferred_delivery_time": {"type": ["string", "null"]},
+        "missing_fields": {"type": "array", "items": {"type": "string"}},
+        "source_text": {"type": "string"},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["code", "message"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "recipient_name",
+        "phone_number",
+        "delivery_address",
+        "delivery_note",
+        "preferred_delivery_time",
+        "missing_fields",
+        "source_text",
+        "errors",
+    ],
+    "additionalProperties": False,
+}
+
+DELIVERY_TOOL_DESCRIPTION = (
+    "Use this tool only when the user provides a customer delivery message and asks to "
+    "extract structured delivery fields. The tool returns recipient name, phone number, "
+    "delivery address, delivery note, preferred delivery time, missing fields, source "
+    "text, and errors. Do not use or present this tool for writing replies, drafting "
+    "emails, customer communication, delivery advice, courier actions, order updates, "
+    "external system calls, or deliverability decisions. If the user asks to write a "
+    "reply, draft a message, contact a courier, change an address, modify an order, or "
+    "decide whether delivery is possible, this tool is out of scope. The correct "
+    "behavior for out-of-scope requests is to avoid using this app for that task and "
+    "state that this app only extracts structured delivery fields from provided "
+    "delivery messages."
+)
+
+DELIVERY_TOOL_DEFINITION: Dict[str, Any] = {
+    "name": DELIVERY_TOOL_NAME,
+    "title": "Delivery Address Extractor",
+    "description": DELIVERY_TOOL_DESCRIPTION,
+    "inputSchema": DELIVERY_INPUT_SCHEMA,
+    "outputSchema": DELIVERY_OUTPUT_SCHEMA,
+    "annotations": {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    },
+}
+
 
 def make_output(
     source_text: str,
@@ -109,6 +186,38 @@ def make_output(
         "refund_reason": refund_reason,
         "customer_request": customer_request,
         "urgency_label": urgency_label,
+        "missing_fields": missing_fields,
+        "source_text": source_text,
+        "errors": errors or [],
+    }
+
+
+def make_delivery_output(
+    source_text: str,
+    recipient_name: Optional[str] = None,
+    phone_number: Optional[str] = None,
+    delivery_address: Optional[str] = None,
+    delivery_note: Optional[str] = None,
+    preferred_delivery_time: Optional[str] = None,
+    errors: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    missing_fields = [
+        field
+        for field, value in [
+            ("recipient_name", recipient_name),
+            ("phone_number", phone_number),
+            ("delivery_address", delivery_address),
+            ("delivery_note", delivery_note),
+            ("preferred_delivery_time", preferred_delivery_time),
+        ]
+        if value is None
+    ]
+    return {
+        "recipient_name": recipient_name,
+        "phone_number": phone_number,
+        "delivery_address": delivery_address,
+        "delivery_note": delivery_note,
+        "preferred_delivery_time": preferred_delivery_time,
         "missing_fields": missing_fields,
         "source_text": source_text,
         "errors": errors or [],
@@ -289,6 +398,107 @@ def extract_refund_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def clean_delivery_value(value: str) -> Optional[str]:
+    cleaned = value.strip(" \t\r\n\"'")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or None
+
+
+def extract_delivery_recipient(text: str) -> Optional[str]:
+    patterns = [
+        r"\bName:\s*([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3})\b",
+        r"\bShip to\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3})\s*,",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return clean_delivery_value(match.group(1).rstrip("."))
+    return None
+
+
+def extract_delivery_phone(text: str) -> Optional[str]:
+    match = re.search(r"\b(?:Phone:\s*)?(\d{3}[-.]\d{3}[-.]\d{4})\b", text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def extract_delivery_address(text: str) -> Optional[str]:
+    patterns = [
+        r"\bAddress:\s*([^.\n]+)",
+        r"\b\d{3}[-.]\d{3}[-.]\d{4}\s*,\s*([^.\n]+)",
+        r"\bsend it to\s+([^.\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return clean_delivery_value(match.group(1).rstrip(","))
+    return None
+
+
+def extract_delivery_note(text: str) -> Optional[str]:
+    patterns = [
+        r"\b(Leave\s+[^.]+\.)",
+        r"\b(Ring\s+[^.]+\.)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            note = clean_delivery_value(match.group(1))
+            if note:
+                return note[0].upper() + note[1:]
+    return None
+
+
+def extract_preferred_delivery_time(text: str) -> Optional[str]:
+    match = re.search(r"\bDeliver\s+([^.\n]+)\.", text, re.IGNORECASE)
+    if match:
+        return clean_delivery_value(match.group(1).lower())
+    return None
+
+
+def is_delivery_out_of_scope(text: str) -> bool:
+    lowered = text.lower()
+    patterns = [
+        r"\bcan\b.*\b(?:deliver|delivered|delivery possible)\b",
+        r"\b(?:judge|decide|determine)\b.*\bdeliver",
+        r"\bcontact\b.*\bcourier\b",
+        r"\b(?:modify|change|update|edit)\b.*\b(?:order|delivery address|address)\b",
+        r"\b(?:write|draft|compose|reply|respond)\b.*\b(?:customer|message|email|reply|response|delivery)\b",
+        r"\b(?:call|send to)\b.*\b(?:external system|api|courier)\b",
+        r"\b(?:advice|advise|recommendation|next steps|what should)\b.*\bdeliver",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def extract_delivery_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if "source_text" not in arguments:
+        return make_delivery_output(
+            "",
+            errors=[{"code": "missing_field", "message": "source_text is required."}],
+        )
+
+    source_text = arguments["source_text"]
+    if not isinstance(source_text, str) or not source_text.strip():
+        return make_delivery_output(
+            source_text if isinstance(source_text, str) else "",
+            errors=[{"code": "invalid_value", "message": "source_text must be a non-empty string."}],
+        )
+
+    if is_delivery_out_of_scope(source_text):
+        return make_delivery_output(
+            source_text,
+            errors=[{"code": "out_of_scope", "message": "The request asks for an action or judgment outside deterministic extraction."}],
+        )
+
+    return make_delivery_output(
+        source_text,
+        recipient_name=extract_delivery_recipient(source_text),
+        phone_number=extract_delivery_phone(source_text),
+        delivery_address=extract_delivery_address(source_text),
+        delivery_note=extract_delivery_note(source_text),
+        preferred_delivery_time=extract_preferred_delivery_time(source_text),
+    )
+
+
 def json_rpc_result(request_id: Any, result: Dict[str, Any]):
     return jsonify({"jsonrpc": "2.0", "id": request_id, "result": result})
 
@@ -329,6 +539,26 @@ def support_page():
     return send_file("support.html")
 
 
+@app.get(f"/{DELIVERY_APP_SLUG}")
+def delivery_app_page():
+    return send_file("delivery_index.html")
+
+
+@app.get(f"/{DELIVERY_APP_SLUG}/privacy")
+def delivery_privacy_page():
+    return send_file("delivery_privacy.html")
+
+
+@app.get(f"/{DELIVERY_APP_SLUG}/terms")
+def delivery_terms_page():
+    return send_file("delivery_terms.html")
+
+
+@app.get(f"/{DELIVERY_APP_SLUG}/support")
+def delivery_support_page():
+    return send_file("delivery_support.html")
+
+
 @app.post(f"/{APP_SLUG}/mcp")
 def app_mcp():
     payload = request.get_json(silent=True) or {}
@@ -357,6 +587,50 @@ def app_mcp():
             structured_content = extract_refund_request(arguments)
         except Exception:
             structured_content = make_output(
+                str(arguments.get("source_text", "")) if isinstance(arguments, dict) else "",
+                errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
+            )
+        has_errors = bool(structured_content["errors"])
+        return json_rpc_result(
+            request_id,
+            {
+                "structuredContent": structured_content,
+                "content": [{"type": "text", "text": "error" if has_errors else "success"}],
+                "isError": has_errors,
+            },
+        )
+
+    return json_rpc_error(request_id, -32601, "Method not found.")
+
+
+@app.post(f"/{DELIVERY_APP_SLUG}/mcp")
+def delivery_app_mcp():
+    payload = request.get_json(silent=True) or {}
+    method = payload.get("method")
+    request_id = payload.get("id")
+
+    if method == "initialize":
+        return json_rpc_result(
+            request_id,
+            {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": DELIVERY_APP_SLUG, "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            },
+        )
+
+    if method == "tools/list":
+        return json_rpc_result(request_id, {"tools": [DELIVERY_TOOL_DEFINITION]})
+
+    if method == "tools/call":
+        params = payload.get("params") or {}
+        if params.get("name") != DELIVERY_TOOL_NAME:
+            return json_rpc_error(request_id, -32602, "Unknown tool.")
+        arguments = params.get("arguments") or {}
+        try:
+            structured_content = extract_delivery_request(arguments)
+        except Exception:
+            structured_content = make_delivery_output(
                 str(arguments.get("source_text", "")) if isinstance(arguments, dict) else "",
                 errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
             )
