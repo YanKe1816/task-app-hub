@@ -73,7 +73,7 @@ def test_landing_page_review_shell(client):
     body = response.get_data(as_text=True)
     assert response.status_code == 200
     assert "text/html" in response.content_type
-    assert "Customer Refund Request Extractor" in body
+    assert "Refund Request Extractor" in body
     assert "This app does not approve refunds." in body
     assert "sidcraigau@gmail.com" in body
 
@@ -83,7 +83,7 @@ def test_privacy_page_review_shell(client):
     body = response.get_data(as_text=True)
     assert response.status_code == 200
     assert "text/html" in response.content_type
-    assert "applies only to Customer Refund Request Extractor" in body
+    assert "applies only to Refund Request Extractor" in body
     assert "No login required." in body
     assert "No long-term storage" in body
     assert "No external API access." in body
@@ -103,7 +103,7 @@ def test_support_page_review_shell(client):
     body = response.get_data(as_text=True)
     assert response.status_code == 200
     assert "text/html" in response.content_type
-    assert "Support page for Customer Refund Request Extractor" in body
+    assert "Support page for Refund Request Extractor" in body
     assert "sidcraigau@gmail.com" in body
 
 
@@ -137,7 +137,7 @@ def test_tools_list_single_tool_contract(client):
     assert len(tools) == 1
     tool = tools[0]
     assert tool["name"] == TOOL_NAME
-    assert tool["title"] == "Customer Refund Request Extractor"
+    assert tool["title"] == "Refund Request Extractor"
     assert tool["description"]
     assert tool["inputSchema"]["required"] == ["source_text"]
     assert tool["outputSchema"] == OUTPUT_SCHEMA
