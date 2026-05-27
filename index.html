@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Customer Refund Request Extractor</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17202a;
+        --muted: #5b6673;
+        --line: #d8dee6;
+        --panel: #f7f8fa;
+        --accent: #0f766e;
+      }
+      body {
+        margin: 0;
+        font-family: Arial, Helvetica, sans-serif;
+        color: var(--ink);
+        background: #ffffff;
+        line-height: 1.55;
+      }
+      main {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 48px 24px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 28px;
+        margin-bottom: 28px;
+      }
+      h1 {
+        font-size: 34px;
+        line-height: 1.18;
+        margin: 0 0 12px;
+      }
+      h2 {
+        font-size: 20px;
+        margin: 30px 0 10px;
+      }
+      p {
+        margin: 0 0 14px;
+      }
+      ul {
+        margin: 10px 0 0;
+        padding-left: 22px;
+      }
+      code {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 2px 5px;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 24px;
+      }
+      a {
+        color: var(--accent);
+      }
+      .purpose {
+        font-size: 18px;
+        color: var(--muted);
+      }
+      .section {
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Customer Refund Request Extractor</h1>
+        <p class="purpose">Extract structured refund request fields from customer refund messages.</p>
+        <nav aria-label="App pages">
+          <a href="/customer-refund-request-extractor/privacy">Privacy</a>
+          <a href="/customer-refund-request-extractor/terms">Terms</a>
+          <a href="/customer-refund-request-extractor/support">Support</a>
+        </nav>
+      </header>
+
+      <section class="section">
+        <h2>What Problem It Solves</h2>
+        <p>Customer refund messages are often written in natural language. This app converts them into stable structured JSON fields for downstream ticketing or human review workflows.</p>
+      </section>
+
+      <section class="section">
+        <h2>Suitable Input</h2>
+        <p>A customer message asking for a refund, replacement, cancellation, or similar refund-related request.</p>
+      </section>
+
+      <section class="section">
+        <h2>Returned Fields</h2>
+        <ul>
+          <li><code>order_id</code></li>
+          <li><code>product_name</code></li>
+          <li><code>refund_reason</code></li>
+          <li><code>customer_request</code></li>
+          <li><code>urgency_label</code></li>
+          <li><code>missing_fields</code></li>
+          <li><code>source_text</code></li>
+          <li><code>errors</code></li>
+        </ul>
+      </section>
+
+      <section class="section">
+        <h2>Boundaries</h2>
+        <ul>
+          <li>This app does not approve refunds.</li>
+          <li>This app does not reject refunds.</li>
+          <li>This app does not promise refunds.</li>
+          <li>This app does not reply to customers.</li>
+          <li>This app does not modify orders.</li>
+          <li>This app does not contact customers.</li>
+          <li>This app does not call external systems.</li>
+          <li>This app does not provide customer service advice.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Support</h2>
+        <p>Support email: <a href="mailto:sidcraigau@gmail.com">sidcraigau@gmail.com</a></p>
+      </section>
+    </main>
+  </body>
+</html>
