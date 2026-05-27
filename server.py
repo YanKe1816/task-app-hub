@@ -26,12 +26,11 @@ INPUT_SCHEMA: Dict[str, Any] = {
 OUTPUT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "status": {"type": "string", "enum": ["success", "error"]},
         "order_id": {"type": ["string", "null"]},
         "product_name": {"type": ["string", "null"]},
         "refund_reason": {"type": ["string", "null"]},
         "customer_request": {"type": ["string", "null"]},
-        "urgency_label": {"type": "string", "enum": ["low", "medium", "high", "unknown"]},
+        "urgency_label": {"type": "string", "enum": ["low", "normal", "high", "unknown"]},
         "missing_fields": {"type": "array", "items": {"type": "string"}},
         "source_text": {"type": "string"},
         "errors": {
@@ -48,7 +47,6 @@ OUTPUT_SCHEMA: Dict[str, Any] = {
         },
     },
     "required": [
-        "status",
         "order_id",
         "product_name",
         "refund_reason",
@@ -87,7 +85,6 @@ TOOL_DEFINITION: Dict[str, Any] = {
 
 
 def make_output(
-    status: str,
     source_text: str,
     order_id: Optional[str] = None,
     product_name: Optional[str] = None,
@@ -107,7 +104,6 @@ def make_output(
         if value is None
     ]
     return {
-        "status": status,
         "order_id": order_id,
         "product_name": product_name,
         "refund_reason": refund_reason,
@@ -131,6 +127,15 @@ def extract_after_label(text: str, labels: List[str]) -> Optional[str]:
     return value or None
 
 
+def clean_product_name(value: str) -> Optional[str]:
+    cleaned = value.strip(" -#:\t.,")
+    cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or cleaned.lower() in {"item", "product", "order"}:
+        return None
+    return cleaned
+
+
 def extract_order_id(text: str) -> Optional[str]:
     patterns = [
         r"\border\s*(?:id|number|no\.?|#)\s*(?:is|:)?\s*([A-Z0-9][A-Z0-9_-]{2,})",
@@ -146,6 +151,19 @@ def extract_order_id(text: str) -> Optional[str]:
 
 
 def extract_product_name(text: str) -> Optional[str]:
+    patterns = [
+        r"\border\s+[A-Z]{1,6}[0-9][A-Z0-9_-]*\s+for\s+(?:product\s+)?((?:a|an|the)\s+)?(.+?)\s+arrived\b",
+        r"\border\s+[A-Z]{1,6}[0-9][A-Z0-9_-]*\s+for\s+(?:product\s+)?((?:a|an|the)\s+)?(.+?)(?:[.;,]|$)",
+        r"\bi\s+bought\s+((?:a|an|the)\s+)?(.+?)\s+and\s+it\s+arrived\b",
+        r"\bthe\s+([^.;,]+?)\s+arrived\s+(?:cracked|damaged|broken|defective)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            product = clean_product_name(match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1))
+            if product:
+                return product
+
     return extract_after_label(text, ["product", "item", "product name", "item name"])
 
 
@@ -154,12 +172,21 @@ def extract_refund_reason(text: str) -> Optional[str]:
     if labeled:
         return labeled
     arrival_condition = re.search(
-        r"\b(?:it|the item|the product)\s+arrived\s+(cracked|damaged|broken|defective)\b",
+        r"\b(?:it|the item|the product|order\s+[A-Z]{1,6}[0-9][A-Z0-9_-]*|.+?)\s+arrived\s+(cracked|damaged|broken|defective)\b",
         text,
         re.IGNORECASE,
     )
     if arrival_condition:
         return f"arrived {arrival_condition.group(1).lower()}"
+    fixed_reason_patterns = [
+        r"\b(item was broken)\b",
+        r"\b(product does not work)\b",
+        r"\b(wrong item was delivered)\b",
+    ]
+    for pattern in fixed_reason_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
     match = re.search(r"\b(?:refund|return)\b.*?\b(?:because|as|since|due to)\s+([^\n.;]+)", text, re.IGNORECASE)
     if match:
         return match.group(1).strip()
@@ -202,7 +229,7 @@ def classify_urgency(text: str) -> str:
     if any(term in lowered for term in low_terms):
         return "low"
     if re.search(r"\brefund\b|\breturn\b", lowered):
-        return "medium"
+        return "normal"
     return "unknown"
 
 
@@ -229,7 +256,6 @@ def is_out_of_scope(text: str) -> bool:
 def extract_refund_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     if "source_text" not in arguments:
         return make_output(
-            "error",
             "",
             errors=[{"code": "missing_field", "message": "source_text is required."}],
         )
@@ -237,14 +263,12 @@ def extract_refund_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     source_text = arguments["source_text"]
     if not isinstance(source_text, str) or not source_text.strip():
         return make_output(
-            "error",
             source_text if isinstance(source_text, str) else "",
             errors=[{"code": "invalid_value", "message": "source_text must be a non-empty string."}],
         )
 
     if is_out_of_scope(source_text):
         return make_output(
-            "error",
             source_text,
             errors=[{"code": "out_of_scope", "message": "The request asks for an action or judgment outside deterministic extraction."}],
         )
@@ -256,7 +280,6 @@ def extract_refund_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     urgency_label = classify_urgency(source_text)
 
     return make_output(
-        "success",
         source_text,
         order_id=order_id,
         product_name=product_name,
@@ -334,16 +357,16 @@ def app_mcp():
             structured_content = extract_refund_request(arguments)
         except Exception:
             structured_content = make_output(
-                "error",
                 str(arguments.get("source_text", "")) if isinstance(arguments, dict) else "",
                 errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
             )
+        has_errors = bool(structured_content["errors"])
         return json_rpc_result(
             request_id,
             {
                 "structuredContent": structured_content,
-                "content": [{"type": "text", "text": structured_content["status"]}],
-                "isError": structured_content["status"] == "error",
+                "content": [{"type": "text", "text": "error" if has_errors else "success"}],
+                "isError": has_errors,
             },
         )
 

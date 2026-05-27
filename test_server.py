@@ -29,8 +29,8 @@ def mcp(client, method, params=None, request_id=1):
 
 def assert_structured_output(value):
     assert set(value.keys()) == EXPECTED_OUTPUT_KEYS
-    assert value["status"] in {"success", "error"}
-    assert value["urgency_label"] in {"low", "medium", "high", "unknown"}
+    assert "status" not in value
+    assert value["urgency_label"] in {"low", "normal", "high", "unknown"}
     assert isinstance(value["missing_fields"], list)
     assert isinstance(value["source_text"], str)
     assert isinstance(value["errors"], list)
@@ -171,9 +171,10 @@ def test_tools_call_complete_refund_message(client):
     )
     result = data["result"]
     assert "structuredContent" in result
+    assert result["isError"] is False
+    assert result["content"] == [{"type": "text", "text": "success"}]
     structured = result["structuredContent"]
     assert_structured_output(structured)
-    assert structured["status"] == "success"
     assert structured["order_id"] == "RF12345"
     assert structured["product_name"] == "Travel Mug"
     assert structured["refund_reason"] == "arrived cracked"
@@ -196,7 +197,6 @@ def test_tools_call_extracts_order_and_arrival_condition_reason(client):
     )
     structured = data["result"]["structuredContent"]
     assert_structured_output(structured)
-    assert structured["status"] == "success"
     assert structured["order_id"] == "RF12345"
     assert structured["product_name"] == "Travel Mug"
     assert structured["refund_reason"] == "arrived cracked"
@@ -207,11 +207,72 @@ def test_tools_call_extracts_order_and_arrival_condition_reason(client):
     assert structured["errors"] == []
 
 
-def test_missing_source_text_error(client):
-    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {}})
+def test_tools_call_extracts_product_from_order_for_pattern(client):
+    source_text = "Order RF12345 for a Travel Mug arrived cracked. I want a refund today or I will file a chargeback."
+    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": source_text}})
     structured = data["result"]["structuredContent"]
     assert_structured_output(structured)
-    assert structured["status"] == "error"
+    assert structured["order_id"] == "RF12345"
+    assert structured["product_name"] == "Travel Mug"
+    assert structured["refund_reason"] == "arrived cracked"
+    assert structured["customer_request"] == "refund"
+    assert structured["urgency_label"] == "high"
+    assert "product_name" not in structured["missing_fields"]
+    assert "refund_reason" not in structured["missing_fields"]
+
+
+def test_tools_call_extracts_product_from_for_product_pattern(client):
+    source_text = "Order RF98765 for product Wireless Mouse arrived damaged. Please refund me."
+    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": source_text}})
+    structured = data["result"]["structuredContent"]
+    assert_structured_output(structured)
+    assert structured["order_id"] == "RF98765"
+    assert structured["product_name"] == "Wireless Mouse"
+    assert structured["refund_reason"] == "arrived damaged"
+    assert structured["customer_request"] == "refund"
+    assert structured["urgency_label"] == "normal"
+
+
+def test_tools_call_extracts_product_from_bought_pattern(client):
+    source_text = "I bought a Desk Lamp and it arrived broken. I want a refund."
+    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": source_text}})
+    structured = data["result"]["structuredContent"]
+    assert_structured_output(structured)
+    assert structured["product_name"] == "Desk Lamp"
+    assert structured["refund_reason"] == "arrived broken"
+    assert structured["customer_request"] == "refund"
+
+
+def test_tools_call_keeps_missing_product_when_not_explicit(client):
+    source_text = "Order RF12345 arrived damaged. I want a refund."
+    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": source_text}})
+    structured = data["result"]["structuredContent"]
+    assert_structured_output(structured)
+    assert structured["order_id"] == "RF12345"
+    assert structured["product_name"] is None
+    assert structured["refund_reason"] == "arrived damaged"
+    assert "product_name" in structured["missing_fields"]
+    assert "refund_reason" not in structured["missing_fields"]
+
+
+def test_tools_call_keeps_missing_reason_when_not_explicit(client):
+    source_text = "Order RF12345 for a Travel Mug. I want a refund."
+    data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": source_text}})
+    structured = data["result"]["structuredContent"]
+    assert_structured_output(structured)
+    assert structured["order_id"] == "RF12345"
+    assert structured["product_name"] == "Travel Mug"
+    assert structured["refund_reason"] is None
+    assert "refund_reason" in structured["missing_fields"]
+    assert "product_name" not in structured["missing_fields"]
+
+
+def test_missing_source_text_error(client):
+    result = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": "error"}]
+    structured = result["structuredContent"]
+    assert_structured_output(structured)
     assert structured["errors"] == [{"code": "missing_field", "message": "source_text is required."}]
 
 
@@ -219,7 +280,6 @@ def test_empty_source_text_error(client):
     data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": "  "}})
     structured = data["result"]["structuredContent"]
     assert_structured_output(structured)
-    assert structured["status"] == "error"
     assert structured["errors"][0]["code"] == "invalid_value"
 
 
@@ -239,7 +299,6 @@ def test_out_of_scope_errors(client, text):
     data = mcp(client, "tools/call", {"name": TOOL_NAME, "arguments": {"source_text": text}})
     structured = data["result"]["structuredContent"]
     assert_structured_output(structured)
-    assert structured["status"] == "error"
     assert structured["errors"][0]["code"] == "out_of_scope"
 
 
