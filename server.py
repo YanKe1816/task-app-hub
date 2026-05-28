@@ -9,6 +9,8 @@ APP_SLUG = "customer-refund-request-extractor"
 TOOL_NAME = "customer_refund_request_extractor"
 DELIVERY_APP_SLUG = "delivery-address-extractor"
 DELIVERY_TOOL_NAME = "delivery_address_extractor"
+SUPPORT_APP_SLUG = "support-message-classifier"
+SUPPORT_TOOL_NAME = "support_message_classifier"
 
 app = Flask(__name__)
 
@@ -160,6 +162,79 @@ DELIVERY_TOOL_DEFINITION: Dict[str, Any] = {
     },
 }
 
+SUPPORT_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_text": {
+            "type": "string",
+            "description": "Raw customer support message to classify and extract structured fields from.",
+        }
+    },
+    "required": ["source_text"],
+    "additionalProperties": False,
+}
+
+SUPPORT_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "issue_type": {
+            "type": ["string", "null"],
+            "description": "The classified support issue type.",
+        },
+        "user_request": {
+            "type": ["string", "null"],
+            "description": "The user's explicit request extracted from the message.",
+        },
+        "urgency_label": {"type": "string", "enum": ["low", "normal", "high", "unknown"]},
+        "missing_fields": {"type": "array", "items": {"type": "string"}},
+        "source_text": {"type": "string"},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["code", "message"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": [
+        "issue_type",
+        "user_request",
+        "urgency_label",
+        "missing_fields",
+        "source_text",
+        "errors",
+    ],
+    "additionalProperties": False,
+}
+
+SUPPORT_TOOL_DESCRIPTION = (
+    "Use this tool when the user provides a customer support message and needs "
+    "structured classification fields. The tool returns issue type, user request, "
+    "urgency label, missing fields, source text, and errors. Do not use this tool to "
+    "reply to the customer, promise a solution, update a ticket system, contact the "
+    "customer, call external systems, or provide customer service advice. This tool is "
+    "useful when deterministic structured support-message classification is needed "
+    "before ticket routing or human review."
+)
+
+SUPPORT_TOOL_DEFINITION: Dict[str, Any] = {
+    "name": SUPPORT_TOOL_NAME,
+    "title": "Support Message Classifier",
+    "description": SUPPORT_TOOL_DESCRIPTION,
+    "inputSchema": SUPPORT_INPUT_SCHEMA,
+    "outputSchema": SUPPORT_OUTPUT_SCHEMA,
+    "annotations": {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    },
+}
+
 
 def make_output(
     source_text: str,
@@ -218,6 +293,31 @@ def make_delivery_output(
         "delivery_address": delivery_address,
         "delivery_note": delivery_note,
         "preferred_delivery_time": preferred_delivery_time,
+        "missing_fields": missing_fields,
+        "source_text": source_text,
+        "errors": errors or [],
+    }
+
+
+def make_support_output(
+    source_text: str,
+    issue_type: Optional[str] = None,
+    user_request: Optional[str] = None,
+    urgency_label: str = "unknown",
+    errors: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    missing_fields = [
+        field
+        for field, value in [
+            ("issue_type", issue_type),
+            ("user_request", user_request),
+        ]
+        if value is None
+    ]
+    return {
+        "issue_type": issue_type,
+        "user_request": user_request,
+        "urgency_label": urgency_label,
         "missing_fields": missing_fields,
         "source_text": source_text,
         "errors": errors or [],
@@ -499,12 +599,129 @@ def extract_delivery_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def classify_support_issue_type(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if re.search(r"\brefund\b|\breturn\b", lowered):
+        return "refund"
+    if re.search(r"\bshipping\b|\bdelivery\b|\btracking\b|\btrack\b|\baddress\b|\bshipment\b", lowered):
+        return "delivery"
+    if re.search(r"\blogin\b|\bpassword\b|\baccount\b|\bsign in\b|\blocked out\b|\blocked account\b", lowered):
+        return "account"
+    if re.search(r"\bcharge\b|\binvoice\b|\bpayment\b|\bsubscription\b|\bbilling\b|\bcard\b", lowered):
+        return "billing"
+    if re.search(r"\berror\b|\bbug\b|\bbroken\b|\bcrash\b|\bnot working\b|\bapp problem\b|\bfeature\b", lowered):
+        return "technical"
+    if re.search(r"\bhelp\b|\bsupport\b|\bquestion\b|\bissue\b|\bproblem\b", lowered):
+        return "general"
+    return None
+
+
+def extract_support_user_request(text: str, issue_type: Optional[str]) -> Optional[str]:
+    lowered = text.lower()
+    if re.search(r"\brefund\b|\breturn\b", lowered):
+        return "refund"
+    if re.search(r"\btrack\b|\btracking\b", lowered):
+        return "tracking help"
+    if re.search(r"\bchange\b.*\baddress\b|\bupdate\b.*\baddress\b", lowered):
+        return "address update help"
+    if re.search(r"\breset\b.*\bpassword\b|\bpassword reset\b", lowered):
+        return "password reset help"
+    if re.search(r"\blogin\b|\bsign in\b|\blocked out\b|\baccount access\b", lowered):
+        return "account access help"
+    if re.search(r"\binvoice\b|\bcharge\b|\bpayment\b|\bbilling\b|\bsubscription\b", lowered):
+        return "billing help"
+    if re.search(r"\berror\b|\bbug\b|\bbroken\b|\bcrash\b|\bnot working\b", lowered):
+        return "technical help"
+    if issue_type == "general":
+        return "support help"
+    return None
+
+
+def classify_support_urgency(text: str, issue_type: Optional[str]) -> str:
+    lowered = text.lower()
+    high_terms = [
+        "urgent",
+        "asap",
+        "immediately",
+        "right now",
+        "deadline",
+        "locked out",
+        "payment failed",
+        "business is down",
+        "business interruption",
+        "cannot access",
+        "third time",
+        "again and again",
+        "repeated",
+    ]
+    low_terms = ["no rush", "not urgent", "whenever possible", "just wondering", "question"]
+    if any(term in lowered for term in high_terms):
+        return "high"
+    if any(term in lowered for term in low_terms):
+        return "low"
+    if issue_type is not None:
+        return "normal"
+    return "unknown"
+
+
+def is_support_out_of_scope(text: str) -> bool:
+    lowered = text.lower()
+    patterns = [
+        r"\b(?:write|draft|compose|reply|respond)\b.*\b(?:customer|message|email|reply|response)\b",
+        r"\bpromise\b.*\b(?:solution|resolution|fix|refund)\b",
+        r"\b(?:update|modify|close|escalate|assign)\b.*\b(?:ticket|case|support ticket)\b",
+        r"\b(?:contact|call|email|reach out)\b.*\bcustomer\b",
+        r"\b(?:call|send to)\b.*\b(?:external system|api|crm|ticket system)\b",
+        r"\b(?:advice|advise|recommendation|next steps|what should)\b",
+        r"\bdecide\b.*\b(?:resolve|resolution|solution)\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def extract_support_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if "source_text" not in arguments:
+        return make_support_output(
+            "",
+            errors=[{"code": "missing_field", "message": "source_text is required."}],
+        )
+
+    source_text = arguments["source_text"]
+    if not isinstance(source_text, str) or not source_text.strip():
+        return make_support_output(
+            source_text if isinstance(source_text, str) else "",
+            errors=[{"code": "invalid_value", "message": "source_text must be a non-empty string."}],
+        )
+
+    if is_support_out_of_scope(source_text):
+        return make_support_output(
+            source_text,
+            errors=[{"code": "out_of_scope", "message": "The request asks for an action or advice outside deterministic classification."}],
+        )
+
+    issue_type = classify_support_issue_type(source_text)
+    user_request = extract_support_user_request(source_text, issue_type)
+    urgency_label = classify_support_urgency(source_text, issue_type)
+    return make_support_output(
+        source_text,
+        issue_type=issue_type,
+        user_request=user_request,
+        urgency_label=urgency_label,
+    )
+
+
 def json_rpc_result(request_id: Any, result: Dict[str, Any]):
     return jsonify({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
 def json_rpc_error(request_id: Any, code: int, message: str):
     return jsonify({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
+
+
+def requested_protocol_version(payload: Dict[str, Any]) -> str:
+    params = payload.get("params")
+    if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
+        return params["protocolVersion"]
+    return "2025-11-25"
 
 
 @app.get("/health")
@@ -559,6 +776,26 @@ def delivery_support_page():
     return send_file("delivery_support.html")
 
 
+@app.get(f"/{SUPPORT_APP_SLUG}")
+def support_classifier_app_page():
+    return send_file("support_classifier_index.html")
+
+
+@app.get(f"/{SUPPORT_APP_SLUG}/privacy")
+def support_classifier_privacy_page():
+    return send_file("support_classifier_privacy.html")
+
+
+@app.get(f"/{SUPPORT_APP_SLUG}/terms")
+def support_classifier_terms_page():
+    return send_file("support_classifier_terms.html")
+
+
+@app.get(f"/{SUPPORT_APP_SLUG}/support")
+def support_classifier_support_page():
+    return send_file("support_classifier_support.html")
+
+
 @app.post(f"/{APP_SLUG}/mcp")
 def app_mcp():
     payload = request.get_json(silent=True) or {}
@@ -569,7 +806,7 @@ def app_mcp():
         return json_rpc_result(
             request_id,
             {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": requested_protocol_version(payload),
                 "serverInfo": {"name": APP_SLUG, "version": "0.1.0"},
                 "capabilities": {"tools": {}},
             },
@@ -603,6 +840,50 @@ def app_mcp():
     return json_rpc_error(request_id, -32601, "Method not found.")
 
 
+@app.post(f"/{SUPPORT_APP_SLUG}/mcp")
+def support_classifier_app_mcp():
+    payload = request.get_json(silent=True) or {}
+    method = payload.get("method")
+    request_id = payload.get("id")
+
+    if method == "initialize":
+        return json_rpc_result(
+            request_id,
+            {
+                "protocolVersion": requested_protocol_version(payload),
+                "serverInfo": {"name": SUPPORT_APP_SLUG, "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            },
+        )
+
+    if method == "tools/list":
+        return json_rpc_result(request_id, {"tools": [SUPPORT_TOOL_DEFINITION]})
+
+    if method == "tools/call":
+        params = payload.get("params") or {}
+        if params.get("name") != SUPPORT_TOOL_NAME:
+            return json_rpc_error(request_id, -32602, "Unknown tool.")
+        arguments = params.get("arguments") or {}
+        try:
+            structured_content = extract_support_request(arguments)
+        except Exception:
+            structured_content = make_support_output(
+                str(arguments.get("source_text", "")) if isinstance(arguments, dict) else "",
+                errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
+            )
+        has_errors = bool(structured_content["errors"])
+        return json_rpc_result(
+            request_id,
+            {
+                "structuredContent": structured_content,
+                "content": [{"type": "text", "text": "error" if has_errors else "success"}],
+                "isError": has_errors,
+            },
+        )
+
+    return json_rpc_error(request_id, -32601, "Method not found.")
+
+
 @app.post(f"/{DELIVERY_APP_SLUG}/mcp")
 def delivery_app_mcp():
     payload = request.get_json(silent=True) or {}
@@ -613,7 +894,7 @@ def delivery_app_mcp():
         return json_rpc_result(
             request_id,
             {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": requested_protocol_version(payload),
                 "serverInfo": {"name": DELIVERY_APP_SLUG, "version": "0.1.0"},
                 "capabilities": {"tools": {}},
             },

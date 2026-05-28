@@ -6,11 +6,23 @@ from urllib.request import urlopen
 
 import pytest
 
-from server import APP_SLUG, DELIVERY_APP_SLUG, DELIVERY_OUTPUT_SCHEMA, DELIVERY_TOOL_NAME, OUTPUT_SCHEMA, TOOL_NAME, app
+from server import (
+    APP_SLUG,
+    DELIVERY_APP_SLUG,
+    DELIVERY_OUTPUT_SCHEMA,
+    DELIVERY_TOOL_NAME,
+    OUTPUT_SCHEMA,
+    SUPPORT_APP_SLUG,
+    SUPPORT_OUTPUT_SCHEMA,
+    SUPPORT_TOOL_NAME,
+    TOOL_NAME,
+    app,
+)
 
 
 EXPECTED_OUTPUT_KEYS = set(OUTPUT_SCHEMA["required"])
 EXPECTED_DELIVERY_OUTPUT_KEYS = set(DELIVERY_OUTPUT_SCHEMA["required"])
+EXPECTED_SUPPORT_OUTPUT_KEYS = set(SUPPORT_OUTPUT_SCHEMA["required"])
 
 
 @pytest.fixture()
@@ -45,6 +57,16 @@ def assert_structured_output(value):
 
 def assert_delivery_structured_output(value):
     assert set(value.keys()) == EXPECTED_DELIVERY_OUTPUT_KEYS
+    assert isinstance(value["missing_fields"], list)
+    assert isinstance(value["source_text"], str)
+    assert isinstance(value["errors"], list)
+    for error in value["errors"]:
+        assert set(error.keys()) == {"code", "message"}
+
+
+def assert_support_structured_output(value):
+    assert set(value.keys()) == EXPECTED_SUPPORT_OUTPUT_KEYS
+    assert value["urgency_label"] in {"low", "normal", "high", "unknown"}
     assert isinstance(value["missing_fields"], list)
     assert isinstance(value["source_text"], str)
     assert isinstance(value["errors"], list)
@@ -137,12 +159,19 @@ def test_openai_apps_challenge_fallback(client, monkeypatch):
 
 
 def test_initialize_contract(client):
-    data = mcp(client, "initialize")
+    data = mcp(client, "initialize", {"protocolVersion": "2025-11-25"})
     result = data["result"]
-    assert result["protocolVersion"] == "2024-11-05"
+    assert result["protocolVersion"] == "2025-11-25"
     assert result["serverInfo"]["name"] == APP_SLUG
     assert result["serverInfo"]["version"] == "0.1.0"
     assert "tools" in result["capabilities"]
+
+
+def test_initialize_contract_defaults_protocol_version(client):
+    data = mcp(client, "initialize")
+    result = data["result"]
+    assert result["protocolVersion"] == "2025-11-25"
+    assert result["serverInfo"]["name"] == APP_SLUG
 
 
 def test_tools_list_single_tool_contract(client):
@@ -164,9 +193,9 @@ def test_tools_list_single_tool_contract(client):
 
 
 def test_delivery_initialize_contract(client):
-    data = mcp_for(client, DELIVERY_APP_SLUG, "initialize")
+    data = mcp_for(client, DELIVERY_APP_SLUG, "initialize", {"protocolVersion": "2025-11-25"})
     result = data["result"]
-    assert result["protocolVersion"] == "2024-11-05"
+    assert result["protocolVersion"] == "2025-11-25"
     assert result["serverInfo"]["name"] == DELIVERY_APP_SLUG
     assert result["serverInfo"]["version"] == "0.1.0"
     assert "tools" in result["capabilities"]
@@ -190,6 +219,34 @@ def test_delivery_tools_list_single_tool_contract(client):
         "destructiveHint": False,
     }
     assert TOOL_NAME not in [tool["name"] for tool in tools]
+
+
+def test_support_classifier_initialize_contract(client):
+    data = mcp_for(client, SUPPORT_APP_SLUG, "initialize", {"protocolVersion": "2025-11-25"})
+    result = data["result"]
+    assert result["protocolVersion"] == "2025-11-25"
+    assert result["serverInfo"]["name"] == SUPPORT_APP_SLUG
+    assert result["serverInfo"]["version"] == "0.1.0"
+    assert "tools" in result["capabilities"]
+
+
+def test_support_classifier_tools_list_single_tool_contract(client):
+    data = mcp_for(client, SUPPORT_APP_SLUG, "tools/list")
+    tools = data["result"]["tools"]
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool["name"] == SUPPORT_TOOL_NAME
+    assert tool["title"] == "Support Message Classifier"
+    assert tool["description"]
+    assert tool["inputSchema"]["required"] == ["source_text"]
+    assert tool["outputSchema"] == SUPPORT_OUTPUT_SCHEMA
+    assert tool["annotations"] == {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    }
+    assert TOOL_NAME not in [tool["name"] for tool in tools]
+    assert DELIVERY_TOOL_NAME not in [tool["name"] for tool in tools]
 
 
 def test_generic_mcp_absent(client):
@@ -230,11 +287,53 @@ def test_delivery_review_shell_routes_are_app_specific_html(client, path, requir
     assert "refund rejection" not in body.lower()
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/{SUPPORT_APP_SLUG}",
+        f"/{SUPPORT_APP_SLUG}/privacy",
+        f"/{SUPPORT_APP_SLUG}/terms",
+        f"/{SUPPORT_APP_SLUG}/support",
+    ],
+)
+def test_support_classifier_placeholder_routes_work(client, path):
+    response = client.get(path)
+    assert response.status_code == 200
+    assert "Support Message Classifier" in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    "path, required_text",
+    [
+        (f"/{SUPPORT_APP_SLUG}", "returns structured JSON"),
+        (f"/{SUPPORT_APP_SLUG}/privacy", "The app is read-only and has no side effects."),
+        (f"/{SUPPORT_APP_SLUG}/terms", "The app is not a customer support advisor."),
+        (f"/{SUPPORT_APP_SLUG}/support", "incorrect classification"),
+    ],
+)
+def test_support_classifier_review_shell_routes_are_app_specific_html(client, path, required_text):
+    response = client.get(path)
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "text/html" in response.content_type
+    assert "<!doctype html>" in body.lower()
+    assert "Support Message Classifier" in body
+    assert "sidcraigau@gmail.com" in body
+    assert required_text in body
+    assert "placeholder" not in body.lower()
+    assert "Refund Request Extractor" not in body
+    assert "Delivery Address Extractor" not in body
+    assert "customer_refund_request_extractor" not in body
+    assert "delivery_address_extractor" not in body
+
+
 def test_cross_endpoint_isolation_and_no_generic_mcp(client):
     refund_tools = mcp_for(client, APP_SLUG, "tools/list")["result"]["tools"]
     delivery_tools = mcp_for(client, DELIVERY_APP_SLUG, "tools/list")["result"]["tools"]
+    support_tools = mcp_for(client, SUPPORT_APP_SLUG, "tools/list")["result"]["tools"]
     assert [tool["name"] for tool in refund_tools] == [TOOL_NAME]
     assert [tool["name"] for tool in delivery_tools] == [DELIVERY_TOOL_NAME]
+    assert [tool["name"] for tool in support_tools] == [SUPPORT_TOOL_NAME]
     assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 404
 
 
@@ -524,4 +623,105 @@ def test_delivery_out_of_scope_errors(client, text):
         {"name": DELIVERY_TOOL_NAME, "arguments": {"source_text": text}},
     )["result"]["structuredContent"]
     assert_delivery_structured_output(structured)
+    assert structured["errors"][0]["code"] == "out_of_scope"
+
+
+def test_support_classifier_tools_call_refund_message(client):
+    source_text = "I need a refund for a damaged item. This is urgent because I have contacted support three times."
+    result = mcp_for(
+        client,
+        SUPPORT_APP_SLUG,
+        "tools/call",
+        {"name": SUPPORT_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]
+    assert "structuredContent" in result
+    assert result["isError"] is False
+    assert result["content"] == [{"type": "text", "text": "success"}]
+    structured = result["structuredContent"]
+    assert_support_structured_output(structured)
+    assert structured["issue_type"] == "refund"
+    assert structured["user_request"] == "refund"
+    assert structured["urgency_label"] == "high"
+    assert structured["missing_fields"] == []
+    assert structured["source_text"] == source_text
+    assert structured["errors"] == []
+
+
+def test_support_classifier_tools_call_account_message(client):
+    source_text = "I cannot access my account after a password reset. Please help."
+    structured = mcp_for(
+        client,
+        SUPPORT_APP_SLUG,
+        "tools/call",
+        {"name": SUPPORT_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]["structuredContent"]
+    assert_support_structured_output(structured)
+    assert structured["issue_type"] == "account"
+    assert structured["user_request"] == "password reset help"
+    assert structured["urgency_label"] == "high"
+    assert structured["errors"] == []
+
+
+def test_support_classifier_tools_call_general_low_message(client):
+    source_text = "Just wondering where I can find support documentation. No rush."
+    structured = mcp_for(
+        client,
+        SUPPORT_APP_SLUG,
+        "tools/call",
+        {"name": SUPPORT_TOOL_NAME, "arguments": {"source_text": source_text}},
+    )["result"]["structuredContent"]
+    assert_support_structured_output(structured)
+    assert structured["issue_type"] == "general"
+    assert structured["user_request"] == "support help"
+    assert structured["urgency_label"] == "low"
+    assert structured["errors"] == []
+
+
+def test_support_classifier_repeated_calls_are_stable(client):
+    params = {
+        "name": SUPPORT_TOOL_NAME,
+        "arguments": {"source_text": "The app crashes with an error when I open billing settings."},
+    }
+    first = mcp_for(client, SUPPORT_APP_SLUG, "tools/call", params, request_id=1)["result"]["structuredContent"]
+    second = mcp_for(client, SUPPORT_APP_SLUG, "tools/call", params, request_id=2)["result"]["structuredContent"]
+    third = mcp_for(client, SUPPORT_APP_SLUG, "tools/call", params, request_id=3)["result"]["structuredContent"]
+    assert first == second == third
+
+
+def test_support_classifier_missing_source_text_error(client):
+    result = mcp_for(client, SUPPORT_APP_SLUG, "tools/call", {"name": SUPPORT_TOOL_NAME, "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": "error"}]
+    structured = result["structuredContent"]
+    assert_support_structured_output(structured)
+    assert structured["errors"] == [{"code": "missing_field", "message": "source_text is required."}]
+
+
+def test_support_classifier_empty_source_text_error(client):
+    structured = mcp_for(
+        client,
+        SUPPORT_APP_SLUG,
+        "tools/call",
+        {"name": SUPPORT_TOOL_NAME, "arguments": {"source_text": "  "}},
+    )["result"]["structuredContent"]
+    assert_support_structured_output(structured)
+    assert structured["errors"][0]["code"] == "invalid_value"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Write a reply to this customer about the issue.",
+        "Promise a solution and update the ticket system.",
+        "Contact the customer and provide next steps.",
+    ],
+)
+def test_support_classifier_out_of_scope_errors(client, text):
+    structured = mcp_for(
+        client,
+        SUPPORT_APP_SLUG,
+        "tools/call",
+        {"name": SUPPORT_TOOL_NAME, "arguments": {"source_text": text}},
+    )["result"]["structuredContent"]
+    assert_support_structured_output(structured)
     assert structured["errors"][0]["code"] == "out_of_scope"
