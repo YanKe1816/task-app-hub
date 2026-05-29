@@ -12,6 +12,9 @@ from server import (
     DELIVERY_OUTPUT_SCHEMA,
     DELIVERY_TOOL_NAME,
     OUTPUT_SCHEMA,
+    RETURN_APP_SLUG,
+    RETURN_OUTPUT_SCHEMA,
+    RETURN_TOOL_NAME,
     SUPPORT_APP_SLUG,
     SUPPORT_OUTPUT_SCHEMA,
     SUPPORT_TOOL_NAME,
@@ -23,6 +26,7 @@ from server import (
 EXPECTED_OUTPUT_KEYS = set(OUTPUT_SCHEMA["required"])
 EXPECTED_DELIVERY_OUTPUT_KEYS = set(DELIVERY_OUTPUT_SCHEMA["required"])
 EXPECTED_SUPPORT_OUTPUT_KEYS = set(SUPPORT_OUTPUT_SCHEMA["required"])
+EXPECTED_RETURN_OUTPUT_KEYS = set(RETURN_OUTPUT_SCHEMA["required"])
 
 
 @pytest.fixture()
@@ -69,6 +73,17 @@ def assert_support_structured_output(value):
     assert value["urgency_label"] in {"low", "normal", "high", "unknown"}
     assert isinstance(value["missing_fields"], list)
     assert isinstance(value["source_text"], str)
+    assert isinstance(value["errors"], list)
+    for error in value["errors"]:
+        assert set(error.keys()) == {"code", "message"}
+
+
+def assert_return_structured_output(value):
+    assert set(value.keys()) == EXPECTED_RETURN_OUTPUT_KEYS
+    assert value["normalized_reason"] in RETURN_OUTPUT_SCHEMA["properties"]["normalized_reason"]["enum"]
+    assert 0 <= value["confidence"] <= 1
+    assert isinstance(value["reason_text"], str)
+    assert isinstance(value["matched_keywords"], list)
     assert isinstance(value["errors"], list)
     for error in value["errors"]:
         assert set(error.keys()) == {"code", "message"}
@@ -249,6 +264,35 @@ def test_support_classifier_tools_list_single_tool_contract(client):
     assert DELIVERY_TOOL_NAME not in [tool["name"] for tool in tools]
 
 
+def test_return_reason_initialize_contract(client):
+    data = mcp_for(client, RETURN_APP_SLUG, "initialize", {"protocolVersion": "2025-11-25"})
+    result = data["result"]
+    assert result["protocolVersion"] == "2025-11-25"
+    assert result["serverInfo"]["name"] == RETURN_APP_SLUG
+    assert result["serverInfo"]["version"] == "0.1.0"
+    assert "tools" in result["capabilities"]
+
+
+def test_return_reason_tools_list_single_tool_contract(client):
+    data = mcp_for(client, RETURN_APP_SLUG, "tools/list")
+    tools = data["result"]["tools"]
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool["name"] == RETURN_TOOL_NAME
+    assert tool["title"] == "Return Reason Normalizer"
+    assert tool["description"]
+    assert tool["inputSchema"]["required"] == ["reason_text"]
+    assert tool["outputSchema"] == RETURN_OUTPUT_SCHEMA
+    assert tool["annotations"] == {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    }
+    assert TOOL_NAME not in [tool["name"] for tool in tools]
+    assert DELIVERY_TOOL_NAME not in [tool["name"] for tool in tools]
+    assert SUPPORT_TOOL_NAME not in [tool["name"] for tool in tools]
+
+
 def test_generic_mcp_absent(client):
     response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert response.status_code == 404
@@ -303,6 +347,48 @@ def test_support_classifier_placeholder_routes_work(client, path):
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        f"/{RETURN_APP_SLUG}",
+        f"/{RETURN_APP_SLUG}/privacy",
+        f"/{RETURN_APP_SLUG}/terms",
+        f"/{RETURN_APP_SLUG}/support",
+    ],
+)
+def test_return_reason_placeholder_routes_work(client, path):
+    response = client.get(path)
+    assert response.status_code == 200
+    assert "Return Reason Normalizer" in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    "path, required_text",
+    [
+        (f"/{RETURN_APP_SLUG}", "Normalizes raw customer return reason text into one fixed category."),
+        (f"/{RETURN_APP_SLUG}/privacy", "The submitted text is used only to return the structured normalization result for the current request."),
+        (f"/{RETURN_APP_SLUG}/terms", "The app only provides structured return reason normalization."),
+        (f"/{RETURN_APP_SLUG}/support", "tool behavior issues"),
+    ],
+)
+def test_return_reason_review_shell_routes_are_app_specific_html(client, path, required_text):
+    response = client.get(path)
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "text/html" in response.content_type
+    assert "<!doctype html>" in body.lower()
+    assert "Return Reason Normalizer" in body
+    assert "sidcraigau@gmail.com" in body
+    assert required_text in body
+    assert "placeholder" not in body.lower()
+    assert "Refund Request Extractor" not in body
+    assert "Delivery Address Extractor" not in body
+    assert "Support Message Classifier" not in body
+    assert "customer_refund_request_extractor" not in body
+    assert "delivery_address_extractor" not in body
+    assert "support_message_classifier" not in body
+
+
+@pytest.mark.parametrize(
     "path, required_text",
     [
         (f"/{SUPPORT_APP_SLUG}", "returns structured JSON"),
@@ -331,9 +417,11 @@ def test_cross_endpoint_isolation_and_no_generic_mcp(client):
     refund_tools = mcp_for(client, APP_SLUG, "tools/list")["result"]["tools"]
     delivery_tools = mcp_for(client, DELIVERY_APP_SLUG, "tools/list")["result"]["tools"]
     support_tools = mcp_for(client, SUPPORT_APP_SLUG, "tools/list")["result"]["tools"]
+    return_tools = mcp_for(client, RETURN_APP_SLUG, "tools/list")["result"]["tools"]
     assert [tool["name"] for tool in refund_tools] == [TOOL_NAME]
     assert [tool["name"] for tool in delivery_tools] == [DELIVERY_TOOL_NAME]
     assert [tool["name"] for tool in support_tools] == [SUPPORT_TOOL_NAME]
+    assert [tool["name"] for tool in return_tools] == [RETURN_TOOL_NAME]
     assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 404
 
 
@@ -725,3 +813,109 @@ def test_support_classifier_out_of_scope_errors(client, text):
     )["result"]["structuredContent"]
     assert_support_structured_output(structured)
     assert structured["errors"][0]["code"] == "out_of_scope"
+
+
+@pytest.mark.parametrize(
+    "reason_text, expected",
+    [
+        ("The item arrived broken and cracked.", "damaged_item"),
+        ("I received the wrong item, not what I ordered.", "wrong_item"),
+        ("The shirt is too small and does not fit.", "size_or_fit_issue"),
+        ("The package arrived late and I no longer need it.", "late_delivery"),
+        ("Some parts are missing from the box.", "missing_parts"),
+    ],
+)
+def test_return_reason_positive_normalization_cases(client, reason_text, expected):
+    result = mcp_for(
+        client,
+        RETURN_APP_SLUG,
+        "tools/call",
+        {"name": RETURN_TOOL_NAME, "arguments": {"reason_text": reason_text}},
+    )["result"]
+    assert "structuredContent" in result
+    assert result["isError"] is False
+    assert result["content"] == [{"type": "text", "text": "success"}]
+    structured = result["structuredContent"]
+    assert_return_structured_output(structured)
+    assert structured["normalized_reason"] == expected
+    assert structured["confidence"] == 0.95
+    assert structured["reason_text"] == reason_text
+    assert structured["matched_keywords"]
+    assert structured["errors"] == []
+
+
+def test_return_reason_tools_call_returns_exact_shape(client):
+    reason_text = "The material feels cheaply made and has a quality problem."
+    structured = mcp_for(
+        client,
+        RETURN_APP_SLUG,
+        "tools/call",
+        {"name": RETURN_TOOL_NAME, "arguments": {"reason_text": reason_text}},
+    )["result"]["structuredContent"]
+    assert_return_structured_output(structured)
+    assert structured["normalized_reason"] == "quality_issue"
+    assert set(structured.keys()) == EXPECTED_RETURN_OUTPUT_KEYS
+
+
+def test_return_reason_repeated_calls_are_stable(client):
+    params = {"name": RETURN_TOOL_NAME, "arguments": {"reason_text": "I bought this twice by mistake."}}
+    first = mcp_for(client, RETURN_APP_SLUG, "tools/call", params, request_id=1)["result"]["structuredContent"]
+    second = mcp_for(client, RETURN_APP_SLUG, "tools/call", params, request_id=2)["result"]["structuredContent"]
+    third = mcp_for(client, RETURN_APP_SLUG, "tools/call", params, request_id=3)["result"]["structuredContent"]
+    assert first == second == third
+    assert first["normalized_reason"] == "duplicate_order"
+
+
+def test_return_reason_missing_field_error(client):
+    result = mcp_for(client, RETURN_APP_SLUG, "tools/call", {"name": RETURN_TOOL_NAME, "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": "error"}]
+    structured = result["structuredContent"]
+    assert_return_structured_output(structured)
+    assert structured == {
+        "normalized_reason": "unknown",
+        "confidence": 0,
+        "reason_text": "",
+        "matched_keywords": [],
+        "errors": [{"code": "missing_field", "message": "reason_text is required."}],
+    }
+
+
+def test_return_reason_invalid_value_error(client):
+    structured = mcp_for(
+        client,
+        RETURN_APP_SLUG,
+        "tools/call",
+        {"name": RETURN_TOOL_NAME, "arguments": {"reason_text": "   "}},
+    )["result"]["structuredContent"]
+    assert_return_structured_output(structured)
+    assert structured == {
+        "normalized_reason": "unknown",
+        "confidence": 0,
+        "reason_text": "   ",
+        "matched_keywords": [],
+        "errors": [{"code": "invalid_value", "message": "reason_text must contain a usable return reason."}],
+    }
+
+
+def test_return_reason_out_of_scope_error(client):
+    reason_text = "Should we approve this return and refund the customer?"
+    structured = mcp_for(
+        client,
+        RETURN_APP_SLUG,
+        "tools/call",
+        {"name": RETURN_TOOL_NAME, "arguments": {"reason_text": reason_text}},
+    )["result"]["structuredContent"]
+    assert_return_structured_output(structured)
+    assert structured == {
+        "normalized_reason": "unknown",
+        "confidence": 0,
+        "reason_text": reason_text,
+        "matched_keywords": [],
+        "errors": [
+            {
+                "code": "out_of_scope",
+                "message": "This tool only normalizes return reasons and does not make decisions or take actions.",
+            }
+        ],
+    }

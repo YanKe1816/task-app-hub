@@ -11,6 +11,8 @@ DELIVERY_APP_SLUG = "delivery-address-extractor"
 DELIVERY_TOOL_NAME = "delivery_address_extractor"
 SUPPORT_APP_SLUG = "support-message-classifier"
 SUPPORT_TOOL_NAME = "support_message_classifier"
+RETURN_APP_SLUG = "return-reason-normalizer"
+RETURN_TOOL_NAME = "return_reason_normalizer"
 
 app = Flask(__name__)
 
@@ -235,6 +237,83 @@ SUPPORT_TOOL_DEFINITION: Dict[str, Any] = {
     },
 }
 
+RETURN_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reason_text": {
+            "type": "string",
+            "description": "Raw customer return reason text to normalize.",
+        }
+    },
+    "required": ["reason_text"],
+    "additionalProperties": False,
+}
+
+RETURN_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "normalized_reason": {
+            "type": "string",
+            "enum": [
+                "damaged_item",
+                "wrong_item",
+                "not_as_described",
+                "size_or_fit_issue",
+                "changed_mind",
+                "late_delivery",
+                "missing_parts",
+                "quality_issue",
+                "duplicate_order",
+                "other",
+                "unknown",
+            ],
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason_text": {"type": "string"},
+        "matched_keywords": {"type": "array", "items": {"type": "string"}},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "enum": ["missing_field", "invalid_value", "out_of_scope", "internal_error"],
+                    },
+                    "message": {"type": "string"},
+                },
+                "required": ["code", "message"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["normalized_reason", "confidence", "reason_text", "matched_keywords", "errors"],
+    "additionalProperties": False,
+}
+
+RETURN_TOOL_DESCRIPTION = (
+    "Use this tool when the user provides a raw customer return reason and needs it "
+    "normalized into one fixed return reason enum. The tool returns normalized_reason, "
+    "confidence, original reason_text, matched_keywords, and errors. Do not use this "
+    "tool to decide whether a return should be accepted, assign responsibility, reply "
+    "to the customer, modify an order, contact anyone, or provide customer service "
+    "advice. This tool is useful when deterministic reason normalization is needed "
+    "before routing, reporting, or human review."
+)
+
+RETURN_TOOL_DEFINITION: Dict[str, Any] = {
+    "name": RETURN_TOOL_NAME,
+    "title": "Return Reason Normalizer",
+    "description": RETURN_TOOL_DESCRIPTION,
+    "inputSchema": RETURN_INPUT_SCHEMA,
+    "outputSchema": RETURN_OUTPUT_SCHEMA,
+    "annotations": {
+        "readOnlyHint": True,
+        "openWorldHint": False,
+        "destructiveHint": False,
+    },
+}
+
 
 def make_output(
     source_text: str,
@@ -320,6 +399,22 @@ def make_support_output(
         "urgency_label": urgency_label,
         "missing_fields": missing_fields,
         "source_text": source_text,
+        "errors": errors or [],
+    }
+
+
+def make_return_output(
+    reason_text: str,
+    normalized_reason: str = "unknown",
+    confidence: float = 0,
+    matched_keywords: Optional[List[str]] = None,
+    errors: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    return {
+        "normalized_reason": normalized_reason,
+        "confidence": confidence,
+        "reason_text": reason_text,
+        "matched_keywords": matched_keywords or [],
         "errors": errors or [],
     }
 
@@ -709,6 +804,87 @@ def extract_support_request(arguments: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+RETURN_REASON_KEYWORDS = [
+    ("damaged_item", ["arrived damaged", "item arrived broken", "defective on arrival", "damaged", "broken", "cracked", "shattered", "smashed"]),
+    ("wrong_item", ["wrong item", "incorrect item", "different product", "not what i ordered", "received another item"]),
+    ("not_as_described", ["not as described", "different from description", "misleading description", "not like the picture", "does not match listing", "product does not match listing"]),
+    ("size_or_fit_issue", ["too small", "too large", "does not fit", "wrong size", "sizing issue", "fit issue"]),
+    ("changed_mind", ["changed my mind", "no longer want it", "do not need it anymore", "bought by mistake", "unwanted item"]),
+    ("late_delivery", ["arrived late", "delivered late", "missed delivery date", "too late", "arrived late"]),
+    ("missing_parts", ["missing parts", "missing pieces", "incomplete package", "parts missing", "parts are missing", "accessory missing"]),
+    ("quality_issue", ["poor quality", "bad quality", "cheaply made", "quality problem", "material issue", "does not work well"]),
+    ("duplicate_order", ["ordered twice", "duplicate order", "bought twice", "bought this twice", "accidental duplicate", "duplicate purchase"]),
+]
+
+
+def is_return_out_of_scope(text: str) -> bool:
+    lowered = text.lower()
+    patterns = [
+        r"\b(?:should we|should i|decide|approve|accept|reject|deny|valid)\b.*\breturn\b",
+        r"\brefund\b.*\b(?:customer|order|now|decision|approve|approval)\b",
+        r"\bwho\b.*\bresponsible\b",
+        r"\b(?:blame|responsibility|responsible)\b",
+        r"\b(?:write|draft|compose|reply|respond)\b.*\b(?:customer|message|email|reply|response)\b",
+        r"\b(?:modify|change|update|mark)\b.*\border\b",
+        r"\b(?:contact|call|email|reach out)\b.*\b(?:customer|anyone)\b",
+        r"\b(?:advice|advise|policy|recommendation|next steps|what should)\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def normalize_return_reason(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if "reason_text" not in arguments:
+        return make_return_output(
+            "",
+            errors=[{"code": "missing_field", "message": "reason_text is required."}],
+        )
+
+    reason_text = arguments["reason_text"]
+    if not isinstance(reason_text, str):
+        return make_return_output(
+            "",
+            errors=[{"code": "invalid_value", "message": "reason_text must contain a usable return reason."}],
+        )
+
+    if not reason_text.strip() or not re.search(r"[A-Za-z0-9]", reason_text):
+        return make_return_output(
+            reason_text,
+            errors=[{"code": "invalid_value", "message": "reason_text must contain a usable return reason."}],
+        )
+
+    if is_return_out_of_scope(reason_text):
+        return make_return_output(
+            reason_text,
+            errors=[
+                {
+                    "code": "out_of_scope",
+                    "message": "This tool only normalizes return reasons and does not make decisions or take actions.",
+                }
+            ],
+        )
+
+    lowered = reason_text.lower()
+    for normalized_reason, keywords in RETURN_REASON_KEYWORDS:
+        matched = [keyword for keyword in keywords if keyword in lowered]
+        if matched:
+            return make_return_output(reason_text, normalized_reason, 0.95, matched)
+
+    indirect_patterns = [
+        ("damaged_item", r"\b(?:does not work|won't work|stopped working)\b"),
+        ("late_delivery", r"\b(?:came after|after the date|past the date)\b"),
+        ("not_as_described", r"\b(?:not what was shown|looks different)\b"),
+    ]
+    for normalized_reason, pattern in indirect_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return make_return_output(reason_text, normalized_reason, 0.75, [match.group(0)])
+
+    if re.search(r"\b(?:return|returned|send it back|exchange)\b", lowered):
+        return make_return_output(reason_text, "other", 0.5, [])
+
+    return make_return_output(reason_text, "unknown", 0, [])
+
+
 def json_rpc_result(request_id: Any, result: Dict[str, Any]):
     return jsonify({"jsonrpc": "2.0", "id": request_id, "result": result})
 
@@ -796,6 +972,26 @@ def support_classifier_support_page():
     return send_file("support_classifier_support.html")
 
 
+@app.get(f"/{RETURN_APP_SLUG}")
+def return_reason_app_page():
+    return send_file("return_reason_index.html")
+
+
+@app.get(f"/{RETURN_APP_SLUG}/privacy")
+def return_reason_privacy_page():
+    return send_file("return_reason_privacy.html")
+
+
+@app.get(f"/{RETURN_APP_SLUG}/terms")
+def return_reason_terms_page():
+    return send_file("return_reason_terms.html")
+
+
+@app.get(f"/{RETURN_APP_SLUG}/support")
+def return_reason_support_page():
+    return send_file("return_reason_support.html")
+
+
 @app.post(f"/{APP_SLUG}/mcp")
 def app_mcp():
     payload = request.get_json(silent=True) or {}
@@ -825,6 +1021,50 @@ def app_mcp():
         except Exception:
             structured_content = make_output(
                 str(arguments.get("source_text", "")) if isinstance(arguments, dict) else "",
+                errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
+            )
+        has_errors = bool(structured_content["errors"])
+        return json_rpc_result(
+            request_id,
+            {
+                "structuredContent": structured_content,
+                "content": [{"type": "text", "text": "error" if has_errors else "success"}],
+                "isError": has_errors,
+            },
+        )
+
+    return json_rpc_error(request_id, -32601, "Method not found.")
+
+
+@app.post(f"/{RETURN_APP_SLUG}/mcp")
+def return_reason_app_mcp():
+    payload = request.get_json(silent=True) or {}
+    method = payload.get("method")
+    request_id = payload.get("id")
+
+    if method == "initialize":
+        return json_rpc_result(
+            request_id,
+            {
+                "protocolVersion": requested_protocol_version(payload),
+                "serverInfo": {"name": RETURN_APP_SLUG, "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            },
+        )
+
+    if method == "tools/list":
+        return json_rpc_result(request_id, {"tools": [RETURN_TOOL_DEFINITION]})
+
+    if method == "tools/call":
+        params = payload.get("params") or {}
+        if params.get("name") != RETURN_TOOL_NAME:
+            return json_rpc_error(request_id, -32602, "Unknown tool.")
+        arguments = params.get("arguments") or {}
+        try:
+            structured_content = normalize_return_reason(arguments)
+        except Exception:
+            structured_content = make_return_output(
+                str(arguments.get("reason_text", "")) if isinstance(arguments, dict) else "",
                 errors=[{"code": "internal_error", "message": "An unexpected internal error occurred."}],
             )
         has_errors = bool(structured_content["errors"])
